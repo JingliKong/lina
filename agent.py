@@ -8,9 +8,11 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.markdown import Markdown
 from rich.status import Status
+from rich.markup import escape as rich_escape
 
 from permissions import PermissionManager, ToolLoopAborted
 from providers import Provider, create_provider
+from providers.base import StreamEvent
 from tools.base import Tool, get_default_tools
 from messages import Message, ToolResult
 from completion import FileReferenceCompleter, expand_file_references
@@ -300,6 +302,7 @@ class Agent:
             # Show spinner while waiting for response
             self._show_status("Answering...")
 
+            event: StreamEvent # Type hinting
             async for event in self.provider.stream(
                 self.messages,
                 self.tools,
@@ -409,3 +412,38 @@ class Agent:
                 break
 
         return True
+    
+    def _truncate(self, text: str, limit: int = 10) -> str:
+        """Truncate multi-line text, returning (display, was_truncated)."""
+        lines = text.split("\n")
+        if len(lines) > limit:
+            return "\n".join(lines[:limit]) + f"\n... ({len(lines) - limit} more lines)"
+        return text
+
+    def _show_tool_execution(self, tool: Tool, call) -> None:
+        """Display that a tool is being executed."""
+        inline, panels = [], []
+        for k, v in call.args.items():
+            if isinstance(v, str) and "\n" in v:
+                panels.append((k, v))
+            else:
+                r = repr(v)
+                inline.append(f"{k}={r[:60]}..." if len(r) > 60 else f"{k}={r}")
+
+        self.console.print(f"\n[dim]▶ {tool.name}({', '.join(inline)})[/dim]")
+        for name, content in panels:
+            self.console.print(Panel(
+                rich_escape(self._truncate(content)),
+                title=f"[dim]{name}[/dim]", title_align="left",
+                border_style="dim", padding=(0, 1),
+            ))
+
+    def _show_tool_result(self, result: str) -> None:
+        """Display a tool result (truncated if long)."""
+        result = rich_escape(result)  # prevent [text] from being parsed as markup
+        lines = result.split("\n")
+        if len(lines) > 10:
+            display = "\n".join(lines[:10]) + f"\n[dim]... ({len(lines) - 10} more lines)[/dim]"
+        else:
+            display = result
+        self.console.print(Panel(display, border_style="dim", padding=(0, 1)))
