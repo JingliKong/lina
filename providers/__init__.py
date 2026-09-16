@@ -1,24 +1,13 @@
 """LLM providers for Henri."""
 
-from henri.config import DEFAULT_PROVIDER
-
-from .anthropic import AnthropicProvider
+from config import DEFAULT_PROVIDER
 from .base import Provider, StreamEvent
-from .bedrock import BedrockProvider
-from .google import GoogleProvider
-from .ollama import OllamaProvider
-from .openai_compatible import OpenAICompatibleProvider
-from .vertex import VertexProvider
-from .copilot_api import CopilotProvider
+from providers.ollama import OllamaProvider
+from providers.copilot_api import CopilotProvider
 
 # Registry of available providers
 PROVIDERS: dict[str, type[Provider]] = {
-    "anthropic": AnthropicProvider,
-    "bedrock": BedrockProvider,
-    "google": GoogleProvider,
     "ollama": OllamaProvider,
-    "openai_compatible": OpenAICompatibleProvider,
-    "vertex": VertexProvider,
     "copilot": CopilotProvider,
 }
 

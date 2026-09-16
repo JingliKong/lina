@@ -12,6 +12,7 @@ from config import (
 )
 def main():
     config = get_provider_config(max_turns=10)
+    hooks = [] # TODO 
     
     asyncio.run(run_agent(
         provider=config.provider,
@@ -19,6 +20,8 @@ def main():
         region=config.region,
         host=config.host,
         max_turns=config.max_turns,
+        hooks=hooks,
+
     ))
 
 
