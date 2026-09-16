@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 import ollama
 
 if TYPE_CHECKING:
-    from henri.tools.base import Tool
+    from tools.base import Tool
 
 from config import DEFAULT_OLLAMA_MODEL, DEFAULT_OLLAMA_HOST
 from messages import Message, ToolCall

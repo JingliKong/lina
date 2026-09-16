@@ -33,6 +33,7 @@ DEFAULT_GOOGLE_LOCATION = "us-central1"
 
 # Ollama defaults
 DEFAULT_OLLAMA_MODEL = "qwen3-coder-30b:latest"
+# DEFAULT_OLLAMA_MODEL = "muse-glimmer-30b:latest"
 DEFAULT_OLLAMA_HOST = "http://localhost:11434"
 
 # Vertex AI defaults (for Claude models)
