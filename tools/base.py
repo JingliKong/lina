@@ -21,12 +21,57 @@ class Tool(ABC):
         """Execute the tool and return the result."""
         pass
 
+# Where full (untruncated) outputs get stashed. Keep this outside the
+# repo you're operating on so it never shows up in grep/glob results.
+_BLOB_DIR = Path.home() / ".henri" / "tool_output_blobs"
+
+MAX_LINES = 200          # per stream (stdout / stderr), after shaping
+MAX_LINE_LEN = 2000      # guard against single absurdly long lines
+                          # (e.g. a minified JS bundle or base64 blob)
+
+def _shape_stream(text: str, label: str, blob_id: str) -> str:
+    """Cap a single stream by line count, saving the full text to a
+    blob file and leaving a ref the model can ask for by id."""
+    if not text:
+        return ""
+
+    lines = text.splitlines()
+
+    # Clip any individual absurd line before counting/joining, so one
+    # 500KB line doesn't defeat the line-count cap.
+    lines = [
+        (ln if len(ln) <= MAX_LINE_LEN else ln[:MAX_LINE_LEN] + " …[line truncated]")
+        for ln in lines
+    ]
+
+    if len(lines) <= MAX_LINES:
+        return "\n".join(lines)
+
+    _BLOB_DIR.mkdir(parents=True, exist_ok=True)
+    blob_path = _BLOB_DIR / f"{blob_id}_{label}.txt"
+    blob_path.write_text(text)
+
+    shown = lines[:MAX_LINES]
+    omitted = len(lines) - MAX_LINES
+    return (
+        "\n".join(shown)
+        + f"\n[{label}: {omitted} more line(s) omitted — "
+        + f"full output saved to {blob_path}. "
+        + f"Use read_file(path=\"{blob_path}\", offset=...) to page through it "
+        + "if these lines aren't enough — don't re-run the command.]"
+    )
+
 
 class BashTool(Tool):
     """Execute shell commands."""
 
     name = "bash"
-    description = "Execute a shell command and return its output."
+    description = (
+        "Execute a shell command and return its output. Output is capped "
+        f"at {MAX_LINES} lines per stream (stdout/stderr); if the command "
+        "produces more, the full output is saved to disk and a path is "
+        "given so you can read specific parts instead of re-running it."
+    )
     parameters = {
         "type": "object",
         "properties": {
@@ -40,6 +85,7 @@ class BashTool(Tool):
     requires_permission = True
 
     def execute(self, command: str) -> str:
+        blob_id = f"{int(time.time() * 1000)}"
         try:
             result = subprocess.run(
                 command,
@@ -48,17 +94,23 @@ class BashTool(Tool):
                 text=True,
                 timeout=120,
             )
-            output = result.stdout
-            if result.stderr:
-                output += f"\n[stderr]\n{result.stderr}"
-            if result.returncode != 0:
-                output += f"\n[exit code: {result.returncode}]"
-            return output or "(no output)"
         except subprocess.TimeoutExpired:
             return "[error: command timed out after 120 seconds]"
         except Exception as e:
             return f"[error: {e}]"
 
+        stdout = _shape_stream(result.stdout, "stdout", blob_id)
+        stderr = _shape_stream(result.stderr, "stderr", blob_id)
+
+        parts = []
+        if stdout:
+            parts.append(stdout)
+        if stderr:
+            parts.append(f"[stderr]\n{stderr}")
+        if result.returncode != 0:
+            parts.append(f"[exit code: {result.returncode}]")
+
+        return "\n".join(parts) if parts else "(no output)"
 
 class ReadFileTool(Tool):
     """Read file contents."""
@@ -223,7 +275,7 @@ class GrepTool(Tool):
         },
         "required": ["pattern"],
     }
-    requires_permission = True  # Permission managed by path (auto-allow within cwd)
+    requires_permission = False  # Permission managed by path (auto-allow within cwd)
 
     def execute(
         self,
