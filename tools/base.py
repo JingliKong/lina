@@ -1,7 +1,9 @@
 """Base tool class and built-in tools."""
 
 import subprocess
+import time
 import urllib.request
+import urllib.error
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -21,28 +23,41 @@ class Tool(ABC):
         """Execute the tool and return the result."""
         pass
 
-# Where full (untruncated) outputs get stashed. Keep this outside the
+
+# ---------------------------------------------------------------------------
+# Shared output-shaping helpers
+#
+# The guiding rule: a tool result should never enter the message list at
+# full size. Cap by *lines* (not characters) so truncation never slices a
+# line in half, and always tell the model what it isn't seeing plus how to
+# get more — a silent cutoff makes the model reason confidently over a
+# partial view, which is worse than a big transcript.
+# ---------------------------------------------------------------------------
+
+# Where full (untruncated) bash outputs get stashed. Keep this outside the
 # repo you're operating on so it never shows up in grep/glob results.
 _BLOB_DIR = Path.home() / ".henri" / "tool_output_blobs"
 
 MAX_LINES = 200          # per stream (stdout / stderr), after shaping
 MAX_LINE_LEN = 2000      # guard against single absurdly long lines
-                          # (e.g. a minified JS bundle or base64 blob)
+                         # (e.g. a minified JS bundle or base64 blob)
+
+
+def _clip_line(line: str) -> str:
+    """Clip one absurdly long line so it can't defeat a line-count cap."""
+    if len(line) <= MAX_LINE_LEN:
+        return line
+    return line[:MAX_LINE_LEN] + " …[line truncated]"
+
 
 def _shape_stream(text: str, label: str, blob_id: str) -> str:
-    """Cap a single stream by line count, saving the full text to a
-    blob file and leaving a ref the model can ask for by id."""
+    """Cap a single stream by line count, saving the full text to a blob
+    file and leaving a path the model can page through instead of
+    re-running the command (which may have side effects)."""
     if not text:
         return ""
 
-    lines = text.splitlines()
-
-    # Clip any individual absurd line before counting/joining, so one
-    # 500KB line doesn't defeat the line-count cap.
-    lines = [
-        (ln if len(ln) <= MAX_LINE_LEN else ln[:MAX_LINE_LEN] + " …[line truncated]")
-        for ln in lines
-    ]
+    lines = [_clip_line(ln) for ln in text.splitlines()]
 
     if len(lines) <= MAX_LINES:
         return "\n".join(lines)
@@ -61,6 +76,10 @@ def _shape_stream(text: str, label: str, blob_id: str) -> str:
         + "if these lines aren't enough — don't re-run the command.]"
     )
 
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
 
 class BashTool(Tool):
     """Execute shell commands."""
@@ -99,6 +118,8 @@ class BashTool(Tool):
         except Exception as e:
             return f"[error: {e}]"
 
+        # stdout and stderr are capped independently, so a huge stdout can
+        # never push a short but important stderr message out of view.
         stdout = _shape_stream(result.stdout, "stdout", blob_id)
         stderr = _shape_stream(result.stderr, "stderr", blob_id)
 
@@ -112,11 +133,17 @@ class BashTool(Tool):
 
         return "\n".join(parts) if parts else "(no output)"
 
+
 class ReadFileTool(Tool):
-    """Read file contents."""
+    """Read file contents, windowed by line number."""
 
     name = "read_file"
-    description = "Read the contents of a file."
+    description = (
+        "Read the contents of a file, returned as a windowed slice of "
+        "lines. Use offset/limit to page through large files instead of "
+        "re-reading from the start — the result tells you if more is "
+        "available and what offset to use next."
+    )
     parameters = {
         "type": "object",
         "properties": {
@@ -124,22 +151,50 @@ class ReadFileTool(Tool):
                 "type": "string",
                 "description": "Path to the file to read",
             },
+            "offset": {
+                "type": "integer",
+                "description": "1-indexed line number to start reading from (default: 1)",
+                "default": 1,
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of lines to return (default: 2000)",
+                "default": 2000,
+            },
         },
         "required": ["path"],
     }
     requires_permission = True  # Permission managed by path (auto-allow within cwd)
 
-    def execute(self, path: str) -> str:
+    def execute(self, path: str, offset: int = 1, limit: int = 2000) -> str:
         try:
             p = Path(path).expanduser()
             if not p.exists():
                 return f"[error: file not found: {path}]"
             if not p.is_file():
                 return f"[error: not a file: {path}]"
-            content = p.read_text()
-            if len(content) > 100_000:
-                return content[:100_000] + "\n[truncated...]"
-            return content
+
+            lines = p.read_text().splitlines()
+            total = len(lines)
+
+            if total == 0:
+                return "(empty file)"
+
+            start = max(offset - 1, 0)
+            if start >= total:
+                return f"[error: offset {offset} is past end of file ({total} lines total)]"
+
+            end = min(start + limit, total)
+            chunk = [_clip_line(ln) for ln in lines[start:end]]
+
+            # Line numbers let the model navigate and cross-reference grep
+            # hits (auth.py:340 -> read_file(offset=320)) without guesswork.
+            numbered = "\n".join(f"{start + i + 1}\t{ln}" for i, ln in enumerate(chunk))
+            header = f"[lines {start + 1}-{end} of {total}]\n"
+            if end < total:
+                header += f"[more available — call again with offset={end + 1}]\n"
+
+            return header + numbered
         except Exception as e:
             return f"[error: {e}]"
 
@@ -244,12 +299,15 @@ class EditFileTool(Tool):
 
 
 class GrepTool(Tool):
-    """Search for patterns in files using ripgrep."""
+    """Search for patterns in files using ripgrep, windowed by match count."""
 
     name = "grep"
     description = (
-        "Search for a regex pattern in files using grep"
-        "Returns matching lines with file paths and line numbers."
+        "Search for a regex pattern in files using grep. Reports total "
+        "match/file counts up front, then returns a windowed slice of "
+        "matches (file:line:content). Use offset/limit to page through "
+        "results, or narrow the pattern/glob if the total count is large "
+        "rather than paging through everything."
     )
     parameters = {
         "type": "object",
@@ -272,10 +330,26 @@ class GrepTool(Tool):
                 "description": "Case-insensitive search",
                 "default": False,
             },
+            "offset": {
+                "type": "integer",
+                "description": "Index of the first match to show (0-indexed, default: 0)",
+                "default": 0,
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of matches to show (default: 50)",
+                "default": 50,
+            },
         },
         "required": ["pattern"],
     }
     requires_permission = False  # Permission managed by path (auto-allow within cwd)
+
+    # Internal safety net, independent of the user-facing `limit`: how many
+    # match lines we're willing to parse from rg's raw output before giving
+    # up on an exact count (protects memory on a pathological pattern that
+    # matches most lines of a huge repo).
+    _PARSE_CEILING = 20_000
 
     def execute(
         self,
@@ -283,29 +357,71 @@ class GrepTool(Tool):
         path: str = ".",
         glob: str | None = None,
         ignore_case: bool = False,
+        offset: int = 0,
+        limit: int = 50,
     ) -> str:
         try:
-            cmd = ["rg", "--line-number", "--max-count", "100"]
+            cmd = ["rg", "--line-number", "--max-count", "2000"]  # per-file safety cap
             if ignore_case:
                 cmd.append("--ignore-case")
             if glob:
                 cmd.extend(["--glob", glob])
             cmd.extend([pattern, path])
 
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            output = result.stdout
-            if result.returncode == 1:  # No matches
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+
+            if result.returncode == 1:  # no matches
                 return "(no matches)"
             if result.returncode != 0:
                 return f"[error: {result.stderr}]"
-            if len(output) > 50_000:
-                output = output[:50_000] + "\n[truncated...]"
-            return output or "(no matches)"
+
+            raw_lines = result.stdout.splitlines()
+            ceiling_hit = len(raw_lines) > self._PARSE_CEILING
+            raw_lines = raw_lines[: self._PARSE_CEILING]
+
+            matches = []       # (file, line_no, content)
+            files_seen = []    # preserve first-seen order
+            files_set = set()
+            for raw in raw_lines:
+                parts = raw.split(":", 2)
+                if len(parts) != 3:
+                    continue  # skip malformed/separator lines defensively
+                file_, line_no, content = parts
+                matches.append((file_, line_no, content))
+                if file_ not in files_set:
+                    files_set.add(file_)
+                    files_seen.append(file_)
+
+            total_matches = len(matches)
+            total_files = len(files_seen)
+
+            if total_matches == 0:
+                return "(no matches)"
+
+            window = matches[offset : offset + limit]
+            shown_lines = "\n".join(
+                f"{f}:{ln}:{_clip_line(c)}" for f, ln, c in window
+            )
+
+            # Scope first, content second: the model can decide to narrow
+            # the search before reading a wall of hits.
+            approx = "~" if ceiling_hit else ""
+            header = f"{approx}{total_matches} match(es) across {total_files} file(s)"
+            if total_matches > limit or offset > 0:
+                shown_end = offset + len(window)
+                header += f" — showing {offset + 1}-{shown_end}"
+                if shown_end < total_matches:
+                    header += f" (call again with offset={shown_end} for more,"
+                    header += " or narrow pattern/glob to reduce the count)"
+            if ceiling_hit:
+                header += (
+                    f"\n[counts are approximate — stopped parsing after "
+                    f"{self._PARSE_CEILING} raw match lines; narrow the "
+                    f"search for an exact count]"
+                )
+
+            return f"{header}\n\n{shown_lines}"
+
         except FileNotFoundError:
             return "[error: ripgrep (rg) not found. Install it: brew install ripgrep]"
         except subprocess.TimeoutExpired:
