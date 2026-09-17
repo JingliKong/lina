@@ -307,7 +307,7 @@ class Agent:
                 self.messages,
                 self.tools,
                 system=self.system_prompt,
-            ):
+            ): # type: ignore
                 if event.text:
                     self._cancel_pondering()
                     self._hide_status()
